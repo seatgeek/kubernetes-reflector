@@ -36,23 +36,33 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                 FullMode = BoundedChannelFullMode.Wait
             });
 
+            Task? consumerTask = null;
             try
             {
                 logger.LogInformation("Requesting {type} resources", typeof(TResource).Name);
 
                 //Read using a separate task so the watcher doesn't get stuck waiting on subscribers to handle the event
-                _ = Task.Run(async () =>
+                consumerTask = Task.Run(async () =>
                 {
                     while (!cancellationToken.IsCancellationRequested)
                     {
                         var watcherEvent = await eventChannel.Reader.ReadAsync(cancellationToken)
                             .ConfigureAwait(false);
                         foreach (var watcherEventHandler in watcherEventHandlers)
-                            await watcherEventHandler.Handle(new WatcherEvent
+                            try
                             {
-                                Item = watcherEvent.Item,
-                                EventType = watcherEvent.EventType
-                            }, cancellationToken);
+                                await watcherEventHandler.Handle(new WatcherEvent
+                                {
+                                    Item = watcherEvent.Item,
+                                    EventType = watcherEvent.EventType
+                                }, cancellationToken);
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            {
+                                logger.LogError(ex,
+                                    "Error handling {eventType} event for {resourceType}",
+                                    watcherEvent.EventType, typeof(TResource).Name);
+                            }
                     }
                 }, cancellationToken);
 
@@ -62,6 +72,15 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                 {
                     await foreach (var (type, item) in watchList)
                     {
+                        if (consumerTask.IsCompleted)
+                        {
+                            logger.LogWarning(
+                                "Event consumer task has stopped unexpectedly for {type}. Forcing session reconnect.",
+                                typeof(TResource).Name);
+                            await cancellationCts.CancelAsync();
+                            break;
+                        }
+
                         if (await OnResourceIgnoreCheck(item)) continue;
                         await eventChannel.Writer.WriteAsync(new WatcherEvent
                         {
@@ -87,6 +106,22 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
             finally
             {
                 eventChannel.Writer.Complete();
+
+                if (consumerTask is not null)
+                {
+                    try
+                    {
+                        await consumerTask.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Event consumer faulted for {type}.", typeof(TResource).Name);
+                    }
+                }
+
                 while (eventChannel.Reader.TryRead(out _)) ;
 
                 var sessionElapsed = sessionStopwatch.Elapsed;

@@ -111,7 +111,7 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                 //Update all auto-sources
                 foreach (var sourceNsName in _autoSources.Keys)
                 {
-                    var properties = _propertiesCache[sourceNsName];
+                    if (!_propertiesCache.TryGetValue(sourceNsName, out var properties)) continue;
 
                     //If it can't be reflected to this namespace, skip
                     if (!properties.CanBeAutoReflectedToNamespace(ns.Name())) continue;
