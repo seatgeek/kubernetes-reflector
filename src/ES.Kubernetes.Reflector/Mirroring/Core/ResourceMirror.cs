@@ -50,14 +50,15 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     /// </summary>
     public async Task Handle(WatcherEvent notification, CancellationToken cancellationToken)
     {
+        var handleStopwatch = System.Diagnostics.Stopwatch.StartNew();
         switch (notification.Item)
         {
             case TResource obj:
                 if (await OnResourceIgnoreCheck(obj)) return;
                 var objNsName = obj.ObjectReference().NamespacedName();
 
-                Logger.LogTrace("Handling {eventType} {resourceType} {resourceNsName}",
-                    notification.EventType, obj.Kind, obj.NamespacedName());
+                Logger.LogDebug("[Mirror:{resourceType}] Handling {eventType} {resourceNsName}",
+                    typeof(TResource).Name, notification.EventType, obj.NamespacedName());
 
 
                 //Remove from the not found, since it exists
@@ -105,8 +106,8 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                 break;
             case V1Namespace ns when notification.EventType == WatchEventType.Added:
             {
-                Logger.LogTrace("Handling {eventType} {resourceType} {resourceRef}", notification.EventType, ns.Kind,
-                    ns.ObjectReference().NamespacedName());
+                Logger.LogDebug("[Mirror:{resourceType}] Handling namespace {eventType} {resourceRef}",
+                    typeof(TResource).Name, notification.EventType, ns.ObjectReference().NamespacedName());
 
                 //Update all auto-sources
                 foreach (var sourceNsName in _autoSources.Keys)
@@ -135,6 +136,14 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
             }
                 break;
         }
+
+        handleStopwatch.Stop();
+        if (handleStopwatch.Elapsed > TimeSpan.FromSeconds(5))
+            Logger.LogWarning("[Mirror:{resourceType}] Handle took {elapsed} for {eventType} event",
+                typeof(TResource).Name, handleStopwatch.Elapsed, notification.EventType);
+        else
+            Logger.LogDebug("[Mirror:{resourceType}] Handle completed in {elapsed} for {eventType} event",
+                typeof(TResource).Name, handleStopwatch.Elapsed, notification.EventType);
     }
 
 
