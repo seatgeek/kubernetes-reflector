@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using ES.Kubernetes.Reflector.Configuration;
 using ES.Kubernetes.Reflector.Watchers.Core.Events;
@@ -39,9 +40,17 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
             Task? consumerTask = null;
             long producedCount = 0;
             long consumedCount = 0;
+            long namespaceExcludedCount = 0;
+
+            var excludedNamespacePatterns = ParseGlobPatterns(options.CurrentValue.Watcher?.ExcludedNamespaces);
             try
             {
-                logger.LogInformation("Requesting {type} resources", typeof(TResource).Name);
+                if (excludedNamespacePatterns.Length > 0)
+                    logger.LogInformation(
+                        "Requesting {type} resources (excluding namespaces matching: {patterns})",
+                        typeof(TResource).Name, options.CurrentValue.Watcher?.ExcludedNamespaces);
+                else
+                    logger.LogInformation("Requesting {type} resources", typeof(TResource).Name);
 
                 //Read using a separate task so the watcher doesn't get stuck waiting on subscribers to handle the event
                 consumerTask = Task.Run(async () =>
@@ -108,6 +117,12 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                                     "[Producer:{type}] Consumer task exception details:", typeof(TResource).Name);
                             await cancellationCts.CancelAsync();
                             break;
+                        }
+
+                        if (IsNamespaceExcluded(item.Metadata?.NamespaceProperty, excludedNamespacePatterns))
+                        {
+                            Interlocked.Increment(ref namespaceExcludedCount);
+                            continue;
                         }
 
                         if (await OnResourceIgnoreCheck(item)) continue;
@@ -197,8 +212,14 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
 
                 var sessionElapsed = sessionStopwatch.Elapsed;
                 sessionStopwatch.Stop();
-                logger.LogInformation("Session closed. Duration: {duration}. Faulted: {faulted}.", sessionElapsed,
-                    sessionFaulted);
+                var nsExcluded = Volatile.Read(ref namespaceExcludedCount);
+                if (nsExcluded > 0)
+                    logger.LogInformation(
+                        "Session closed. Duration: {duration}. Faulted: {faulted}. Namespace-excluded events: {excluded}.",
+                        sessionElapsed, sessionFaulted, nsExcluded);
+                else
+                    logger.LogInformation("Session closed. Duration: {duration}. Faulted: {faulted}.",
+                        sessionElapsed, sessionFaulted);
 
                 foreach (var handler in watcherClosedHandlers)
                     await handler.Handle(new WatcherClosed
@@ -213,4 +234,25 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
     protected abstract IAsyncEnumerable<(WatchEventType, TResource)> OnGetWatcher(CancellationToken cancellationToken);
 
     protected virtual Task<bool> OnResourceIgnoreCheck(TResource item) => Task.FromResult(false);
+
+    /// <summary>
+    ///     Parses a comma-separated list of glob patterns into compiled Regex objects.
+    ///     Supports * (any characters) and ? (single character).
+    /// </summary>
+    private static Regex[] ParseGlobPatterns(string? patterns)
+    {
+        if (string.IsNullOrWhiteSpace(patterns)) return [];
+        return patterns.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => new Regex(
+                "^" + Regex.Escape(p).Replace("\\*", ".*").Replace("\\?", ".") + "$",
+                RegexOptions.Compiled))
+            .ToArray();
+    }
+
+    private static bool IsNamespaceExcluded(string? ns, Regex[] patterns)
+    {
+        if (patterns.Length == 0 || string.IsNullOrEmpty(ns)) return false;
+        return patterns.Any(p => p.IsMatch(ns));
+    }
 }
