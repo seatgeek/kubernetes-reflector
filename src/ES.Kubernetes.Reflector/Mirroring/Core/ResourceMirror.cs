@@ -25,6 +25,9 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     protected readonly IKubernetes Kubernetes = kubernetes;
     protected readonly ILogger Logger = logger;
 
+    private long _skippedEventCount;
+    private long _processedEventCount;
+
 
     /// <summary>
     ///     Handles <see cref="WatcherClosed" /> notifications
@@ -34,6 +37,12 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
         //If not TResource or Namespace, not something this instance should handle
         if (notification.ResourceType != typeof(TResource) &&
             notification.ResourceType != typeof(V1Namespace)) return Task.CompletedTask;
+
+        var skipped = Interlocked.Exchange(ref _skippedEventCount, 0);
+        var processed = Interlocked.Exchange(ref _processedEventCount, 0);
+        Logger.LogInformation(
+            "[Mirror:{resourceType}] Session closed. Events processed: {processed}, skipped (no annotations): {skipped}, propertiesCache size: {cacheSize}",
+            typeof(TResource).Name, processed, skipped, _propertiesCache.Count);
 
         Logger.LogDebug("Cleared sources for {Type} resources", typeof(TResource).Name);
 
@@ -50,6 +59,7 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     /// </summary>
     public async Task Handle(WatcherEvent notification, CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _processedEventCount);
         var handleStopwatch = System.Diagnostics.Stopwatch.StartNew();
         switch (notification.Item)
         {
@@ -151,6 +161,19 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     {
         var objNsName = obj.NamespacedName();
         var objProperties = obj.GetMirroringProperties();
+
+        // Fast path: if this resource has no reflector annotations at all and we haven't
+        // seen it before as a reflection target, skip all processing. This avoids caching
+        // and processing the vast majority of resources in large clusters.
+        if (!objProperties.Allowed && !objProperties.IsReflection &&
+            !_directReflectionCache.ContainsKey(objNsName) &&
+            !_autoReflectionCache.ContainsKey(objNsName))
+        {
+            Interlocked.Increment(ref _skippedEventCount);
+            Logger.LogTrace("[Mirror:{resourceType}] Skipping {objNsName} — no reflector annotations",
+                typeof(TResource).Name, objNsName);
+            return;
+        }
 
         _propertiesCache.AddOrUpdate(objNsName, objProperties,
             (_, _) => objProperties);
