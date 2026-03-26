@@ -1,9 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(dotnet build:*)",
-      "Bash(grep -r \"ES_\\\\|ASPNETCORE_\\\\|DOTNET_\\\\|Serilog\" /Users/kangov/Workspace/github/seatgeek/kubernetes-reflector --include=*.md --include=*.txt --include=*.dockerfile --include=Dockerfile*)",
-      "Bash(find /Users/kangov/Workspace/github/seatgeek/kubernetes-reflector -name values.yaml -o -name values*.yaml)"
+      "Bash(dotnet build:*)"
     ],
     "deny": [],
     "ask": []
