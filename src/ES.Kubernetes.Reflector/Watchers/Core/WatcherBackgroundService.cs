@@ -32,7 +32,7 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                 CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, absoluteTimeoutCts.Token);
             var cancellationToken = cancellationCts.Token;
 
-            var eventChannel = Channel.CreateBounded<WatcherEvent>(new BoundedChannelOptions(256)
+            var eventChannel = Channel.CreateBounded<WatcherEvent>(new BoundedChannelOptions(1024)
             {
                 FullMode = BoundedChannelFullMode.Wait
             });
@@ -132,11 +132,11 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                         var currentProduced = Interlocked.Increment(ref producedCount);
                         if (channelCount > 200)
                             logger.LogWarning(
-                                "[Producer:{type}] Channel near capacity: {count}/256 before writing event #{eventNum} ({eventType} {name})",
+                                "[Producer:{type}] Channel near capacity: {count}/1024 before writing event #{eventNum} ({eventType} {name})",
                                 typeof(TResource).Name, channelCount, currentProduced, type, itemName);
                         else
                             logger.LogDebug(
-                                "[Producer:{type}] Writing event #{eventNum} ({eventType} {name}). Channel depth: {count}/256",
+                                "[Producer:{type}] Writing event #{eventNum} ({eventType} {name}). Channel depth: {count}/1024",
                                 typeof(TResource).Name, currentProduced, type, itemName, channelCount);
 
                         writeStopwatch.Restart();
