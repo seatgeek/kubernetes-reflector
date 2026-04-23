@@ -135,7 +135,7 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                         var itemName = item.Metadata?.Name ?? "unknown";
                         var channelCount = eventChannel.Reader.Count;
                         var currentProduced = Interlocked.Increment(ref producedCount);
-                        if (channelCount > 200)
+                        if (channelCount > 768) // 75% of channel capacity
                             logger.LogWarning(
                                 "[Producer:{type}] Channel near capacity: {count}/1024 before writing event #{eventNum} ({eventType} {name})",
                                 typeof(TResource).Name, channelCount, currentProduced, type, itemName);
