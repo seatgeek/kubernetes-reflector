@@ -1,5 +1,4 @@
 ﻿using System.Diagnostics;
-using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using ES.Kubernetes.Reflector.Configuration;
 using ES.Kubernetes.Reflector.Watchers.Core.Events;
@@ -42,7 +41,10 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
             long consumedCount = 0;
             long namespaceExcludedCount = 0;
 
-            var excludedNamespacePatterns = ParseGlobPatterns(options.CurrentValue.Watcher?.ExcludedNamespaces);
+            // Kubernetes namespace names must be valid DNS-1123 labels, which are lowercase-only,
+            // so normalizing the configured exclusion patterns to lowercase ensures comparisons
+            // against Metadata.NamespaceProperty are consistent without changing semantics.
+            var excludedNamespacePatterns = GlobMatcher.ParseGlobPatterns(options.CurrentValue.Watcher?.ExcludedNamespaces?.ToLower());
             try
             {
                 if (excludedNamespacePatterns.Length > 0)
@@ -119,7 +121,10 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                             break;
                         }
 
-                        if (IsNamespaceExcluded(item.Metadata?.NamespaceProperty, excludedNamespacePatterns))
+                        // For cluster-scoped resources like V1Namespace, Metadata.NamespaceProperty is null,
+                        // so this exclusion check intentionally becomes a no-op and namespace events
+                        // continue flowing to support auto-reflection on new namespace creation.
+                        if (GlobMatcher.IsNamespaceExcluded(item.Metadata?.NamespaceProperty, excludedNamespacePatterns))
                         {
                             Interlocked.Increment(ref namespaceExcludedCount);
                             continue;
@@ -235,24 +240,4 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
 
     protected virtual Task<bool> OnResourceIgnoreCheck(TResource item) => Task.FromResult(false);
 
-    /// <summary>
-    ///     Parses a comma-separated list of glob patterns into compiled Regex objects.
-    ///     Supports * (any characters) and ? (single character).
-    /// </summary>
-    private static Regex[] ParseGlobPatterns(string? patterns)
-    {
-        if (string.IsNullOrWhiteSpace(patterns)) return [];
-        return patterns.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(p => !string.IsNullOrWhiteSpace(p))
-            .Select(p => new Regex(
-                "^" + Regex.Escape(p).Replace("\\*", ".*").Replace("\\?", ".") + "$",
-                RegexOptions.Compiled))
-            .ToArray();
-    }
-
-    private static bool IsNamespaceExcluded(string? ns, Regex[] patterns)
-    {
-        if (patterns.Length == 0 || string.IsNullOrEmpty(ns)) return false;
-        return patterns.Any(p => p.IsMatch(ns));
-    }
 }
