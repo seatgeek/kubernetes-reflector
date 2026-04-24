@@ -74,8 +74,10 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                             {
                                 var handlerName = watcherEventHandler.GetType().Name;
                                 handlerStopwatch.Restart();
-                                logger.LogTrace("[Consumer:{type}] Invoking handler {handler} for event #{count}",
-                                    typeof(TResource).Name, handlerName, eventCount);
+                                logger.LogDebug(
+                                    "[Consumer:{type}] Invoking handler {handler} for event #{count} ({eventType} {resourceName})",
+                                    typeof(TResource).Name, handlerName, eventCount, watcherEvent.EventType,
+                                    (watcherEvent.Item as IKubernetesObject<V1ObjectMeta>)?.Metadata?.Name ?? "unknown");
                                 await watcherEventHandler.Handle(new WatcherEvent
                                 {
                                     Item = watcherEvent.Item,
@@ -100,6 +102,25 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                             }
                     }
                     logger.LogDebug("[Consumer:{type}] Consumer loop exited (cancellation requested).", typeof(TResource).Name);
+                }, cancellationToken);
+
+                // Watchdog: fires every 30s and warns if the consumer hasn't made progress while
+                // events are still pending — this catches hangs inside handler K8s API calls.
+                var watchdogTask = Task.Run(async () =>
+                {
+                    var lastSeen = consumedCount;
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        try { await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken); }
+                        catch (OperationCanceledException) { break; }
+                        var current = consumedCount;
+                        var pending = eventChannel.Reader.Count;
+                        if (current == lastSeen && pending > 0)
+                            logger.LogWarning(
+                                "[Watchdog:{type}] Consumer has not made progress in 30s — consumed: {consumed}, channel depth: {pending}",
+                                typeof(TResource).Name, current, pending);
+                        lastSeen = current;
+                    }
                 }, cancellationToken);
 
                 var watchList = OnGetWatcher(cancellationToken);
