@@ -36,15 +36,12 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-            Task? consumerTask = null;
-            long producedCount = 0;
-            long consumedCount = 0;
-            long namespaceExcludedCount = 0;
-
             // Kubernetes namespace names must be valid DNS-1123 labels, which are lowercase-only,
             // so normalizing the configured exclusion patterns to lowercase ensures comparisons
             // against Metadata.NamespaceProperty are consistent without changing semantics.
-            var excludedNamespacePatterns = GlobMatcher.ParseGlobPatterns(options.CurrentValue.Watcher?.ExcludedNamespaces?.ToLower());
+            var excludedNamespacePatterns = GlobMatcher.ParseGlobPatterns(options.CurrentValue.Watcher?.ExcludedNamespaces?.ToLowerInvariant());
+            long namespaceExcludedCount = 0;
+
             try
             {
                 if (excludedNamespacePatterns.Length > 0)
@@ -55,71 +52,18 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                     logger.LogInformation("Requesting {type} resources", typeof(TResource).Name);
 
                 //Read using a separate task so the watcher doesn't get stuck waiting on subscribers to handle the event
-                consumerTask = Task.Run(async () =>
+                _ = Task.Run(async () =>
                 {
-                    logger.LogDebug("[Consumer:{type}] Consumer task started.", typeof(TResource).Name);
-                    var handlerStopwatch = new Stopwatch();
                     while (!cancellationToken.IsCancellationRequested)
                     {
-                        logger.LogTrace("[Consumer:{type}] Waiting to read from channel. Pending items: {count}",
-                            typeof(TResource).Name, eventChannel.Reader.Count);
                         var watcherEvent = await eventChannel.Reader.ReadAsync(cancellationToken)
                             .ConfigureAwait(false);
-                        var eventCount = Interlocked.Increment(ref consumedCount);
-                        logger.LogDebug("[Consumer:{type}] Dequeued event #{count}: {eventType} for {resource}",
-                            typeof(TResource).Name, eventCount, watcherEvent.EventType,
-                            (watcherEvent.Item as IKubernetesObject<V1ObjectMeta>)?.Metadata?.Name ?? "unknown");
                         foreach (var watcherEventHandler in watcherEventHandlers)
-                            try
+                            await watcherEventHandler.Handle(new WatcherEvent
                             {
-                                var handlerName = watcherEventHandler.GetType().Name;
-                                handlerStopwatch.Restart();
-                                logger.LogDebug(
-                                    "[Consumer:{type}] Invoking handler {handler} for event #{count} ({eventType} {resourceName})",
-                                    typeof(TResource).Name, handlerName, eventCount, watcherEvent.EventType,
-                                    (watcherEvent.Item as IKubernetesObject<V1ObjectMeta>)?.Metadata?.Name ?? "unknown");
-                                await watcherEventHandler.Handle(new WatcherEvent
-                                {
-                                    Item = watcherEvent.Item,
-                                    EventType = watcherEvent.EventType
-                                }, cancellationToken);
-                                handlerStopwatch.Stop();
-                                if (handlerStopwatch.Elapsed > TimeSpan.FromSeconds(5))
-                                    logger.LogWarning(
-                                        "[Consumer:{type}] Handler {handler} took {elapsed} for event #{count} ({eventType})",
-                                        typeof(TResource).Name, handlerName, handlerStopwatch.Elapsed, eventCount,
-                                        watcherEvent.EventType);
-                                else
-                                    logger.LogDebug(
-                                        "[Consumer:{type}] Handler {handler} completed in {elapsed} for event #{count}",
-                                        typeof(TResource).Name, handlerName, handlerStopwatch.Elapsed, eventCount);
-                            }
-                            catch (Exception ex) when (ex is not OperationCanceledException)
-                            {
-                                logger.LogError(ex,
-                                    "Error handling {eventType} event for {resourceType}",
-                                    watcherEvent.EventType, typeof(TResource).Name);
-                            }
-                    }
-                    logger.LogDebug("[Consumer:{type}] Consumer loop exited (cancellation requested).", typeof(TResource).Name);
-                }, cancellationToken);
-
-                // Watchdog: fires every 30s and warns if the consumer hasn't made progress while
-                // events are still pending — this catches hangs inside handler K8s API calls.
-                var watchdogTask = Task.Run(async () =>
-                {
-                    var lastSeen = consumedCount;
-                    while (!cancellationToken.IsCancellationRequested)
-                    {
-                        try { await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken); }
-                        catch (OperationCanceledException) { break; }
-                        var current = consumedCount;
-                        var pending = eventChannel.Reader.Count;
-                        if (current == lastSeen && pending > 0)
-                            logger.LogWarning(
-                                "[Watchdog:{type}] Consumer has not made progress in 30s — consumed: {consumed}, channel depth: {pending}",
-                                typeof(TResource).Name, current, pending);
-                        lastSeen = current;
+                                Item = watcherEvent.Item,
+                                EventType = watcherEvent.EventType
+                            }, cancellationToken);
                     }
                 }, cancellationToken);
 
@@ -127,59 +71,24 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
 
                 try
                 {
-                    var writeStopwatch = new Stopwatch();
                     await foreach (var (type, item) in watchList)
                     {
-                        if (consumerTask.IsCompleted)
-                        {
-                            logger.LogWarning(
-                                "[Producer:{type}] Event consumer task has stopped unexpectedly (Status={status}). Forcing session reconnect.",
-                                typeof(TResource).Name, consumerTask.Status);
-                            if (consumerTask.Exception is not null)
-                                logger.LogWarning(consumerTask.Exception,
-                                    "[Producer:{type}] Consumer task exception details:", typeof(TResource).Name);
-                            await cancellationCts.CancelAsync();
-                            break;
-                        }
-
                         // For cluster-scoped resources like V1Namespace, Metadata.NamespaceProperty is null,
                         // so this exclusion check intentionally becomes a no-op and namespace events
                         // continue flowing to support auto-reflection on new namespace creation.
                         if (GlobMatcher.IsNamespaceExcluded(item.Metadata?.NamespaceProperty, excludedNamespacePatterns))
                         {
-                            Interlocked.Increment(ref namespaceExcludedCount);
+                            namespaceExcludedCount++;
                             continue;
                         }
 
                         if (await OnResourceIgnoreCheck(item)) continue;
-
-                        var itemName = item.Metadata?.Name ?? "unknown";
-                        var channelCount = eventChannel.Reader.Count;
-                        var currentProduced = Interlocked.Increment(ref producedCount);
-                        if (channelCount > 768) // 75% of channel capacity
-                            logger.LogWarning(
-                                "[Producer:{type}] Channel near capacity: {count}/1024 before writing event #{eventNum} ({eventType} {name})",
-                                typeof(TResource).Name, channelCount, currentProduced, type, itemName);
-                        else
-                            logger.LogDebug(
-                                "[Producer:{type}] Writing event #{eventNum} ({eventType} {name}). Channel depth: {count}/1024",
-                                typeof(TResource).Name, currentProduced, type, itemName, channelCount);
-
-                        writeStopwatch.Restart();
                         await eventChannel.Writer.WriteAsync(new WatcherEvent
                         {
                             Item = item,
                             EventType = type
                         }, cancellationToken).ConfigureAwait(false);
-                        writeStopwatch.Stop();
-                        if (writeStopwatch.Elapsed > TimeSpan.FromSeconds(1))
-                            logger.LogWarning(
-                                "[Producer:{type}] WriteAsync blocked for {elapsed} on event #{eventNum} — channel was full (consumer may be stalled)",
-                                typeof(TResource).Name, writeStopwatch.Elapsed, currentProduced);
                     }
-
-                    logger.LogDebug("[Producer:{type}] Watch stream ended. Total events produced: {count}",
-                        typeof(TResource).Name, Volatile.Read(ref producedCount));
                 }
                 catch (OperationCanceledException)
                 {
@@ -198,51 +107,14 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
             finally
             {
                 eventChannel.Writer.Complete();
-                logger.LogDebug("[Cleanup:{type}] Channel writer completed. Produced={produced}, Consumed={consumed}",
-                    typeof(TResource).Name, Volatile.Read(ref producedCount), Volatile.Read(ref consumedCount));
-
-                if (consumerTask is not null)
-                {
-                    logger.LogDebug("[Cleanup:{type}] Awaiting consumer task (Status={status})...",
-                        typeof(TResource).Name, consumerTask.Status);
-                    var drainStopwatch = Stopwatch.StartNew();
-                    try
-                    {
-                        // Give the consumer a bounded time to drain before we give up
-                        var completed = await Task.WhenAny(consumerTask, Task.Delay(TimeSpan.FromSeconds(30), CancellationToken.None))
-                            .ConfigureAwait(false);
-                        if (completed != consumerTask)
-                            logger.LogWarning(
-                                "[Cleanup:{type}] Consumer task did not finish within 30s drain timeout (Status={status}). Possible deadlock.",
-                                typeof(TResource).Name, consumerTask.Status);
-                        else
-                            await consumerTask.ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "Event consumer faulted for {type}.", typeof(TResource).Name);
-                    }
-                    drainStopwatch.Stop();
-                    logger.LogDebug("[Cleanup:{type}] Consumer task drain took {elapsed}. Final status: {status}",
-                        typeof(TResource).Name, drainStopwatch.Elapsed, consumerTask.Status);
-                }
-
-                var drained = 0;
-                while (eventChannel.Reader.TryRead(out _)) drained++;
-                if (drained > 0)
-                    logger.LogWarning("[Cleanup:{type}] Drained {count} unconsumed events from channel.",
-                        typeof(TResource).Name, drained);
+                while (eventChannel.Reader.TryRead(out _)) ;
 
                 var sessionElapsed = sessionStopwatch.Elapsed;
                 sessionStopwatch.Stop();
-                var nsExcluded = Volatile.Read(ref namespaceExcludedCount);
-                if (nsExcluded > 0)
+                if (namespaceExcludedCount > 0)
                     logger.LogInformation(
                         "Session closed. Duration: {duration}. Faulted: {faulted}. Namespace-excluded events: {excluded}.",
-                        sessionElapsed, sessionFaulted, nsExcluded);
+                        sessionElapsed, sessionFaulted, namespaceExcludedCount);
                 else
                     logger.LogInformation("Session closed. Duration: {duration}. Faulted: {faulted}.",
                         sessionElapsed, sessionFaulted);
