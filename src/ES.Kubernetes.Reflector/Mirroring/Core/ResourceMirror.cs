@@ -29,6 +29,9 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     protected readonly IKubernetes Kubernetes = kubernetes;
     protected readonly ILogger Logger = logger;
 
+    private long _skippedEventCount;
+    private long _processedEventCount;
+
 
     /// <summary>
     ///     Handles <see cref="WatcherClosed" /> notifications
@@ -38,6 +41,12 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
         //If not TResource or Namespace, not something this instance should handle
         if (notification.ResourceType != typeof(TResource) &&
             notification.ResourceType != typeof(V1Namespace)) return Task.CompletedTask;
+
+        var skipped = Interlocked.Exchange(ref _skippedEventCount, 0);
+        var processed = Interlocked.Exchange(ref _processedEventCount, 0);
+        Logger.LogInformation(
+            "[Mirror:{resourceType}] Session closed. Events processed: {processed}, skipped (no annotations): {skipped}, propertiesCache size: {cacheSize}",
+            typeof(TResource).Name, processed, skipped, _propertiesCache.Count);
 
         Logger.LogDebug("Cleared sources for {Type} resources", typeof(TResource).Name);
 
@@ -56,14 +65,16 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     /// </summary>
     public async Task Handle(WatcherEvent notification, CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _processedEventCount);
+        var handleStopwatch = System.Diagnostics.Stopwatch.StartNew();
         switch (notification.Item)
         {
             case TResource obj:
                 if (await OnResourceIgnoreCheck(obj)) return;
                 var objNsName = obj.ObjectReference().NamespacedName();
 
-                Logger.LogTrace("Handling {eventType} {resourceType} {resourceNsName}",
-                    notification.EventType, obj.Kind, obj.NamespacedName());
+                Logger.LogDebug("[Mirror:{resourceType}] Handling {eventType} {resourceNsName}",
+                    typeof(TResource).Name, notification.EventType, obj.NamespacedName());
 
 
                 //Remove from the not found, since it exists
@@ -112,8 +123,8 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                 break;
             case V1Namespace ns when notification.EventType is WatchEventType.Added or WatchEventType.Modified:
             {
-                Logger.LogTrace("Handling {eventType} {resourceType} {resourceRef}", notification.EventType, ns.Kind,
-                    ns.ObjectReference().NamespacedName());
+                Logger.LogDebug("[Mirror:{resourceType}] Handling namespace {eventType} {resourceRef}",
+                    typeof(TResource).Name, notification.EventType, ns.ObjectReference().NamespacedName());
 
                 // Skip reconciliation when only non-label fields changed (status, annotations, resourceVersion).
                 // Reflection eligibility is purely a function of namespace name and labels.
@@ -128,7 +139,8 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                 //Update all auto-sources
                 foreach (var sourceNsName in _autoSources.Keys)
                 {
-                    var properties = _propertiesCache[sourceNsName];
+                    if (!_propertiesCache.TryGetValue(sourceNsName, out var properties)) continue;
+
                     var autoReflections = _autoReflectionCache.GetOrAdd(sourceNsName, []);
                     var reflectionNsName = sourceNsName with { Namespace = ns.Name() };
 
@@ -197,6 +209,17 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
             }
                 break;
         }
+
+        handleStopwatch.Stop();
+        var resourceDesc = (notification.Item as IKubernetesObject<V1ObjectMeta>)?.Metadata is { } meta
+            ? $"{meta.NamespaceProperty}/{meta.Name}"
+            : "unknown";
+        if (handleStopwatch.Elapsed > TimeSpan.FromSeconds(5))
+            Logger.LogWarning("[Mirror:{resourceType}] Handle took {elapsed} for {eventType} {resourceDesc}",
+                typeof(TResource).Name, handleStopwatch.Elapsed, notification.EventType, resourceDesc);
+        else
+            Logger.LogDebug("[Mirror:{resourceType}] Handle completed in {elapsed} for {eventType} {resourceDesc}",
+                typeof(TResource).Name, handleStopwatch.Elapsed, notification.EventType, resourceDesc);
     }
 
 
@@ -204,6 +227,19 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     {
         var objNsName = obj.NamespacedName();
         var objProperties = obj.GetMirroringProperties();
+
+        // Fast path: if this resource has no reflector annotations at all and we haven't
+        // seen it before as a reflection target, skip all processing. This avoids caching
+        // and processing the vast majority of resources in large clusters.
+        if (!objProperties.Allowed && !objProperties.IsReflection &&
+            !_directReflectionCache.ContainsKey(objNsName) &&
+            !_autoReflectionCache.ContainsKey(objNsName))
+        {
+            Interlocked.Increment(ref _skippedEventCount);
+            Logger.LogTrace("[Mirror:{resourceType}] Skipping {objNsName} — no reflector annotations",
+                typeof(TResource).Name, objNsName);
+            return;
+        }
 
         _propertiesCache.AddOrUpdate(objNsName, objProperties,
             (_, _) => objProperties);
@@ -408,15 +444,32 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     private async Task AutoReflectionForSource(NamespacedName sourceNsName, TResource? sourceObj,
         CancellationToken cancellationToken)
     {
-        Logger.LogDebug("Processing auto-reflection source {sourceNsName}", sourceNsName);
+        var autoSw = System.Diagnostics.Stopwatch.StartNew();
+        Logger.LogDebug("[Mirror:{resourceType}] AutoReflectionForSource starting for {sourceNsName}. Active auto-sources: {count}",
+            typeof(TResource).Name, sourceNsName, _autoSources.Count(kvp => kvp.Value));
         var sourceProperties = _propertiesCache[sourceNsName];
 
         var autoReflectionList = _autoReflectionCache
             .GetOrAdd(sourceNsName, _ => []);
 
+        var apiSw = System.Diagnostics.Stopwatch.StartNew();
         var matches = await OnResourceWithNameList(sourceNsName.Name);
+        if (apiSw.Elapsed > TimeSpan.FromSeconds(5))
+            Logger.LogWarning("[Mirror:{resourceType}] OnResourceWithNameList({name}) took {elapsed}, returned {count} matches",
+                typeof(TResource).Name, sourceNsName.Name, apiSw.Elapsed, matches.Length);
+        else
+            Logger.LogDebug("[Mirror:{resourceType}] OnResourceWithNameList({name}) took {elapsed}, returned {count} matches",
+                typeof(TResource).Name, sourceNsName.Name, apiSw.Elapsed, matches.Length);
+
+        apiSw.Restart();
         var namespaces = (await Kubernetes.CoreV1
             .ListNamespaceAsync(cancellationToken: cancellationToken)).Items;
+        if (apiSw.Elapsed > TimeSpan.FromSeconds(5))
+            Logger.LogWarning("[Mirror:{resourceType}] ListNamespaceAsync took {elapsed}, returned {count} namespaces",
+                typeof(TResource).Name, apiSw.Elapsed, namespaces.Count);
+        else
+            Logger.LogDebug("[Mirror:{resourceType}] ListNamespaceAsync took {elapsed}, returned {count} namespaces",
+                typeof(TResource).Name, apiSw.Elapsed, namespaces.Count);
 
         //Cache namespaces for label selector lookups
         foreach (var ns in namespaces)
@@ -494,9 +547,10 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
         }
 
         Logger.LogInformation(
-            "Auto-reflected {sourceNsName} where permitted. " +
+            "[Mirror:{resourceType}] Auto-reflected {sourceNsName} in {elapsed}. " +
             "Created {createdCount} - Updated {updatedCount} - Deleted {deletedCount} - Validated {skippedCount}.",
-            sourceNsName, toCreate.Count, toUpdate.Count, toDelete.Count, toSkip.Count);
+            typeof(TResource).Name, sourceNsName, autoSw.Elapsed,
+            toCreate.Count, toUpdate.Count, toDelete.Count, toSkip.Count);
     }
 
 
@@ -558,9 +612,14 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
 
                 try
                 {
+                    var createSw = System.Diagnostics.Stopwatch.StartNew();
                     await OnResourceCreate(newResource, reflectionNsName.Namespace);
-                    Logger.LogInformation("Created {reflectionNsName} as a reflection of {sourceNsName}",
-                        reflectionNsName, sourceNsName);
+                    if (createSw.Elapsed > TimeSpan.FromSeconds(5))
+                        Logger.LogWarning("[Mirror:{resourceType}] Created {reflectionNsName} as reflection of {sourceNsName} — took {elapsed}",
+                            typeof(TResource).Name, reflectionNsName, sourceNsName, createSw.Elapsed);
+                    else
+                        Logger.LogInformation("[Mirror:{resourceType}] Created {reflectionNsName} as reflection of {sourceNsName} in {elapsed}",
+                            typeof(TResource).Name, reflectionNsName, sourceNsName, createSw.Elapsed);
                     return;
                 }
                 catch (HttpOperationException ex) when (ex.Response.StatusCode == HttpStatusCode.Conflict)
@@ -587,9 +646,14 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
             await OnResourceConfigurePatch(source, patchDoc);
 
             var patch = JsonConvert.SerializeObject(patchDoc, Formatting.Indented);
+            var patchSw = System.Diagnostics.Stopwatch.StartNew();
             await OnResourceApplyPatch(new V1Patch(patch, V1Patch.PatchType.JsonPatch), reflectionNsName);
-            Logger.LogInformation("Patched {reflectionNsName} as a reflection of {sourceNsName}",
-                reflectionNsName, sourceNsName);
+            if (patchSw.Elapsed > TimeSpan.FromSeconds(5))
+                Logger.LogWarning("[Mirror:{resourceType}] Patched {reflectionNsName} as reflection of {sourceNsName} — took {elapsed}",
+                    typeof(TResource).Name, reflectionNsName, sourceNsName, patchSw.Elapsed);
+            else
+                Logger.LogInformation("[Mirror:{resourceType}] Patched {reflectionNsName} as reflection of {sourceNsName} in {elapsed}",
+                    typeof(TResource).Name, reflectionNsName, sourceNsName, patchSw.Elapsed);
         }
         catch (Exception ex)
         {
@@ -612,14 +676,22 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
     {
         try
         {
-            Logger.LogDebug("Retrieving {id}", resourceNsName);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Logger.LogDebug("[Mirror:{resourceType}] TryResourceGet {id}", typeof(TResource).Name, resourceNsName);
             var resource = await OnResourceGet(resourceNsName);
+            if (sw.Elapsed > TimeSpan.FromSeconds(5))
+                Logger.LogWarning("[Mirror:{resourceType}] TryResourceGet {id} completed in {elapsed}",
+                    typeof(TResource).Name, resourceNsName, sw.Elapsed);
+            else
+                Logger.LogDebug("[Mirror:{resourceType}] TryResourceGet {id} completed in {elapsed}",
+                    typeof(TResource).Name, resourceNsName, sw.Elapsed);
             _notFoundCache.TryRemove(resourceNsName, out _);
             return resource;
         }
         catch (HttpOperationException ex) when (ex.Response.StatusCode == HttpStatusCode.NotFound)
         {
-            Logger.LogDebug("Could not find {nsName}", resourceNsName);
+            Logger.LogDebug("[Mirror:{resourceType}] TryResourceGet {id} returned NotFound",
+                typeof(TResource).Name, resourceNsName);
             _notFoundCache.TryAdd(resourceNsName, true);
             return null;
         }
