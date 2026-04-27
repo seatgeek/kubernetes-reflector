@@ -42,6 +42,7 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
             var excludedNamespacePatterns = GlobMatcher.ParseGlobPatterns(options.CurrentValue.Watcher?.ExcludedNamespaces?.ToLowerInvariant());
             long namespaceExcludedCount = 0;
 
+            Task? consumerTask = null;
             try
             {
                 if (excludedNamespacePatterns.Length > 0)
@@ -52,18 +53,25 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                     logger.LogInformation("Requesting {type} resources", typeof(TResource).Name);
 
                 //Read using a separate task so the watcher doesn't get stuck waiting on subscribers to handle the event
-                _ = Task.Run(async () =>
+                consumerTask = Task.Run(async () =>
                 {
-                    while (!cancellationToken.IsCancellationRequested)
+                    await foreach (var watcherEvent in eventChannel.Reader.ReadAllAsync(cancellationToken))
                     {
-                        var watcherEvent = await eventChannel.Reader.ReadAsync(cancellationToken)
-                            .ConfigureAwait(false);
                         foreach (var watcherEventHandler in watcherEventHandlers)
-                            await watcherEventHandler.Handle(new WatcherEvent
+                            try
                             {
-                                Item = watcherEvent.Item,
-                                EventType = watcherEvent.EventType
-                            }, cancellationToken);
+                                await watcherEventHandler.Handle(new WatcherEvent
+                                {
+                                    Item = watcherEvent.Item,
+                                    EventType = watcherEvent.EventType
+                                }, cancellationToken);
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            {
+                                logger.LogError(ex,
+                                    "Error handling {eventType} event for {resourceType}",
+                                    watcherEvent.EventType, typeof(TResource).Name);
+                            }
                     }
                 }, cancellationToken);
 
@@ -73,6 +81,15 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                 {
                     await foreach (var (type, item) in watchList)
                     {
+                        if (consumerTask.IsCompleted)
+                        {
+                            logger.LogWarning(
+                                "Event consumer task has stopped unexpectedly for {type}. Forcing session reconnect.",
+                                typeof(TResource).Name);
+                            await cancellationCts.CancelAsync();
+                            break;
+                        }
+
                         // For cluster-scoped resources like V1Namespace, Metadata.NamespaceProperty is null,
                         // so this exclusion check intentionally becomes a no-op and namespace events
                         // continue flowing to support auto-reflection on new namespace creation.
@@ -107,7 +124,21 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
             finally
             {
                 eventChannel.Writer.Complete();
-                while (eventChannel.Reader.TryRead(out _)) ;
+
+                if (consumerTask is not null)
+                {
+                    try
+                    {
+                        await consumerTask.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Event consumer faulted for {type}.", typeof(TResource).Name);
+                    }
+                }
 
                 var sessionElapsed = sessionStopwatch.Elapsed;
                 sessionStopwatch.Stop();

@@ -447,7 +447,12 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
         var autoSw = System.Diagnostics.Stopwatch.StartNew();
         Logger.LogDebug("[Mirror:{resourceType}] AutoReflectionForSource starting for {sourceNsName}. Active auto-sources: {count}",
             typeof(TResource).Name, sourceNsName, _autoSources.Count(kvp => kvp.Value));
-        var sourceProperties = _propertiesCache[sourceNsName];
+        if (!_propertiesCache.TryGetValue(sourceNsName, out var sourceProperties))
+        {
+            Logger.LogWarning("[Mirror:{resourceType}] AutoReflectionForSource skipping {sourceNsName} — not in properties cache",
+                typeof(TResource).Name, sourceNsName);
+            return;
+        }
 
         var autoReflectionList = _autoReflectionCache
             .GetOrAdd(sourceNsName, _ => []);
