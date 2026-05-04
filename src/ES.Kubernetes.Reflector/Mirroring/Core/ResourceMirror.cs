@@ -48,6 +48,13 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
             "[Mirror:{resourceType}] Session closed. Events processed: {processed}, skipped (no annotations): {skipped}, propertiesCache size: {cacheSize}",
             typeof(TResource).Name, processed, skipped, _propertiesCache.Count);
 
+        if (notification.ResourceType == typeof(V1Namespace))
+        {
+            Logger.LogDebug("Cleared namespace cache for {Type} resources", typeof(TResource).Name);
+            _namespaceCache.Clear();
+            return Task.CompletedTask;
+        }
+
         Logger.LogDebug("Cleared sources for {Type} resources", typeof(TResource).Name);
 
         _autoSources.Clear();
@@ -55,6 +62,7 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
         _notFoundCache.Clear();
         _propertiesCache.Clear();
         _autoReflectionCache.Clear();
+        _directReflectionCache.Clear();
         _lastWarnedSelectorErrors.Clear();
 
         return Task.CompletedTask;
