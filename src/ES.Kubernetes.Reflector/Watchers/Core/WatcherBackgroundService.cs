@@ -55,23 +55,32 @@ public abstract class WatcherBackgroundService<TResource, TResourceList>(
                 //Read using a separate task so the watcher doesn't get stuck waiting on subscribers to handle the event
                 consumerTask = Task.Run(async () =>
                 {
-                    await foreach (var watcherEvent in eventChannel.Reader.ReadAllAsync(cancellationToken))
+                    try
                     {
-                        foreach (var watcherEventHandler in watcherEventHandlers)
-                            try
-                            {
-                                await watcherEventHandler.Handle(new WatcherEvent
+                        while (!cancellationToken.IsCancellationRequested)
+                        {
+                            var watcherEvent = await eventChannel.Reader.ReadAsync(cancellationToken)
+                                .ConfigureAwait(false);
+                            foreach (var watcherEventHandler in watcherEventHandlers)
+                                try
                                 {
-                                    Item = watcherEvent.Item,
-                                    EventType = watcherEvent.EventType
-                                }, cancellationToken);
-                            }
-                            catch (Exception ex) when (ex is not OperationCanceledException)
-                            {
-                                logger.LogError(ex,
-                                    "Error handling {eventType} event for {resourceType}",
-                                    watcherEvent.EventType, typeof(TResource).Name);
-                            }
+                                    await watcherEventHandler.Handle(new WatcherEvent
+                                    {
+                                        Item = watcherEvent.Item,
+                                        EventType = watcherEvent.EventType
+                                    }, cancellationToken);
+                                }
+                                catch (Exception ex) when (ex is not OperationCanceledException)
+                                {
+                                    logger.LogError(ex,
+                                        "Error handling {eventType} event for {resourceType}",
+                                        watcherEvent.EventType, typeof(TResource).Name);
+                                }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Expected on session shutdown when cancellation propagates through API calls.
                     }
                 }, cancellationToken);
 
