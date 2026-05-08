@@ -415,7 +415,6 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                         return;
                     }
 
-
                     //Find the source resource
                     MirroringProperties sourceProperties;
                     if (!_propertiesCache.TryGetValue(sourceNsName, out var props))
