@@ -2,8 +2,7 @@ name: fork-build
 
 on:
   push:
-    branches-ignore:
-      - main
+    branches: ["**"]
   workflow_dispatch:
 
 jobs:
