@@ -1,10 +1,6 @@
 name: Pipeline
 
 on:
-  push:
-    branches:
-      - "**" # Matches all branches
-
   workflow_dispatch:
     inputs:
       force_build:
