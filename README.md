@@ -162,7 +162,7 @@ $ kubectl -n kube-system apply -f https://github.com/emberstack/kubernetes-refle
 
 ## `cert-manager` support
 
-> Since version 1.5 of cert-manager you can annotate secrets created from certificates for mirroring using `secretTemplate`  (see https://cert-manager.io/docs/usage/certificate/).
+> Since version 1.5 of cert-manager you can annotate secrets created from certificates for mirroring using `secretTemplate` (see https://cert-manager.io/docs/usage/certificate/).
 
 ```yaml
 apiVersion: cert-manager.io/v1
@@ -176,8 +176,8 @@ spec:
   ...
   ```
 
-=======
-> Since version 1.15 of cert-manager you can annotate `Ingress` to create secrets created from certificates for mirroring using `cert-manager.io/secret-template` annotation  (see https://github.com/cert-manager/cert-manager/pull/6839).
+> Since version 1.15 of cert-manager you can annotate `Ingress` to create secrets created from certificates for mirroring using the `cert-manager.io/secret-template` annotation (see https://github.com/cert-manager/cert-manager/pull/6839).
+
 ```yaml
 apiVersion: networking.k8s.io/v1
 kind: Ingress
