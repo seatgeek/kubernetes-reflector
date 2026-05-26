@@ -102,7 +102,7 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
 
 
                 //Remove from the not found, since it exists
-                _notFoundCache.Remove(obj.NamespacedName(), out _);
+                _notFoundCache.TryRemove(obj.NamespacedName(), out _);
 
                 switch (notification.EventType)
                 {
@@ -111,34 +111,34 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                         await HandleUpsert(obj, cancellationToken);
                         break;
                     case WatchEventType.Deleted:
+                    {
+                        _propertiesCache.TryRemove(objNsName, out _);
+                        _lastWarnedSelectorErrors.TryRemove(objNsName, out _);
+                        var properties = obj.GetMirroringProperties();
+
+                        if (!properties.IsReflection)
                         {
-                            _propertiesCache.Remove(objNsName, out _);
-                            _lastWarnedSelectorErrors.TryRemove(objNsName, out _);
-                            var properties = obj.GetMirroringProperties();
+                            if (properties.IsAutoMirrorSource() &&
+                                _autoReflectionCache.TryGetValue(objNsName, out var reflectionList))
+                                foreach (var reflectionNsName in reflectionList.ToArray())
+                                {
+                                    Logger.LogDebug("Deleting {objNsName} - Source {sourceNsName} has been deleted",
+                                        reflectionNsName, objNsName);
+                                    await OnResourceDelete(reflectionNsName);
+                                }
 
-                            if (!properties.IsReflection)
-                            {
-                                if (properties.IsAutoMirrorSource() &&
-                                    _autoReflectionCache.TryGetValue(objNsName, out var reflectionList))
-                                    foreach (var reflectionNsName in reflectionList.ToArray())
-                                    {
-                                        Logger.LogDebug("Deleting {objNsName} - Source {sourceNsName} has been deleted",
-                                            reflectionNsName, objNsName);
-                                        await OnResourceDelete(reflectionNsName);
-                                    }
-
-                                _autoSources.Remove(objNsName, out _);
-                                _rememberedAutoMirrorSources.TryRemove(objNsName, out _);
-                                _directReflectionCache.Remove(objNsName, out _);
-                                _autoReflectionCache.Remove(objNsName, out _);
-                            }
-                            else
-                            {
-                                foreach (var item in _directReflectionCache) item.Value.Remove(objNsName);
-                                foreach (var item in _autoReflectionCache) item.Value.Remove(objNsName);
-                            }
+                            _autoSources.TryRemove(objNsName, out _);
+                            _rememberedAutoMirrorSources.TryRemove(objNsName, out _);
+                            _directReflectionCache.TryRemove(objNsName, out _);
+                            _autoReflectionCache.TryRemove(objNsName, out _);
+                        }
+                        else
+                        {
+                            foreach (var item in _directReflectionCache) item.Value.Remove(objNsName);
+                            foreach (var item in _autoReflectionCache) item.Value.Remove(objNsName);
                         }
                         break;
+                    }
                     case WatchEventType.Error:
                     case WatchEventType.Bookmark:
                     default:
@@ -305,21 +305,19 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                     //Delete any cached auto-reflections that are no longer valid
                     if (_autoReflectionCache.TryGetValue(objNsName, out reflectionList))
                     {
-                        var reflections = reflectionList
+                        var reflectionsToDelete = reflectionList
                             .Where(s => !CanBeReflectedToNamespaceCached(objProperties, s.Namespace))
                             .ToHashSet();
-                        foreach (var reflectionNsName in reflections)
+
+                        foreach (var reflectionNsName in reflectionsToDelete)
                         {
                             reflectionList.Remove(reflectionNsName);
-
                             Logger.LogInformation(
-                                "Source {sourceNsName} no longer permits the auto reflection to {reflectionNsName}. " +
-                                "Deleting {reflectionNsName}.",
+                                "Source {sourceNsName} no longer permits the auto reflection to {reflectionNsName}. Deleting {reflectionNsName}.",
                                 objNsName, reflectionNsName, reflectionNsName);
                             await OnResourceDelete(reflectionNsName);
                         }
                     }
-
 
                     var isAutoSource = objProperties.IsAutoMirrorSource();
 
@@ -329,12 +327,12 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
                     UpdateRememberedAutoMirror(objNsName, objProperties);
 
                     //If not allowed or auto is disabled, remove the cache for auto-reflections
-                    if (!isAutoSource) _autoReflectionCache.Remove(objNsName, out _);
+                    if (!isAutoSource) _autoReflectionCache.TryRemove(objNsName, out _);
 
                     //If reflection is disabled, remove the reflections cache and stop reflecting
                     if (!objProperties.Allowed)
                     {
-                        _directReflectionCache.Remove(objNsName, out _);
+                        _directReflectionCache.TryRemove(objNsName, out _);
                         return;
                     }
 
@@ -368,7 +366,6 @@ public abstract class ResourceMirror<TResource>(ILogger logger, IKubernetes kube
 
                     //Ensure updated auto-reflections
                     if (isAutoSource) await AutoReflectionForSource(objNsName, obj, cancellationToken);
-
 
                     return;
                 }
